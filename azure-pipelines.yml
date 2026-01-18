@@ -1,0 +1,182 @@
+# Azure DevOps Pipeline for User Address Directory API
+# This pipeline builds, tests, and deploys the application to Azure Container Instances
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    exclude:
+      - README.md
+      - docs/*
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  - name: MAVEN_CACHE_FOLDER
+    value: $(Pipeline.Workspace)/.m2/repository
+  - name: MAVEN_OPTS
+    value: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)'
+  - name: dockerRegistryServiceConnection
+    value: 'azureContainerRegistry'
+  - name: imageRepository
+    value: 'addressbook-api'
+  - name: containerRegistry
+    value: 'yourregistry.azurecr.io'
+  - name: dockerfilePath
+    value: '$(Build.SourcesDirectory)/Dockerfile'
+  - name: tag
+    value: '$(Build.BuildId)'
+
+stages:
+  # Build and Test Stage
+  - stage: Build
+    displayName: 'Build and Test'
+    jobs:
+      - job: BuildAndTest
+        displayName: 'Build, Test, and Analyze'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          # Cache Maven dependencies
+          - task: Cache@2
+            displayName: 'Cache Maven Dependencies'
+            inputs:
+              key: 'maven | "$(Agent.OS)" | **/pom.xml'
+              restoreKeys: |
+                maven | "$(Agent.OS)"
+              path: $(MAVEN_CACHE_FOLDER)
+
+          # Set up Java
+          - task: JavaToolInstaller@0
+            displayName: 'Install Java 17'
+            inputs:
+              versionSpec: '17'
+              jdkArchitectureOption: 'x64'
+              jdkSourceOption: 'PreInstalled'
+
+          # Build and run tests
+          - task: Maven@4
+            displayName: 'Maven Build and Test'
+            inputs:
+              mavenPomFile: 'pom.xml'
+              goals: 'clean verify'
+              options: '$(MAVEN_OPTS) -Drevision=$(Build.BuildNumber)'
+              publishJUnitResults: true
+              testResultsFiles: '**/surefire-reports/TEST-*.xml'
+              javaHomeOption: 'JDKVersion'
+              jdkVersionOption: '1.17'
+              mavenVersionOption: 'Default'
+              mavenOptions: '-Xmx3072m $(MAVEN_OPTS)'
+              mavenAuthenticateFeed: false
+              effectivePomSkip: false
+              sonarQubeRunAnalysis: false
+
+          # Publish code coverage results
+          - task: PublishCodeCoverageResults@2
+            displayName: 'Publish Code Coverage'
+            inputs:
+              codeCoverageTool: 'JaCoCo'
+              summaryFileLocation: '$(Build.SourcesDirectory)/target/site/jacoco/jacoco.xml'
+              pathToSources: '$(Build.SourcesDirectory)/src/main/java'
+              failIfCoverageEmpty: true
+
+          # Publish test results
+          - task: PublishTestResults@2
+            displayName: 'Publish Test Results'
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/TEST-*.xml'
+              mergeTestResults: true
+              failTaskOnFailedTests: true
+
+          # Copy artifacts
+          - task: CopyFiles@2
+            displayName: 'Copy JAR to Staging'
+            inputs:
+              SourceFolder: '$(Build.SourcesDirectory)/target'
+              Contents: '*.jar'
+              TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+          # Publish build artifacts
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Build Artifacts'
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'drop'
+              publishLocation: 'Container'
+
+  # Docker Build and Push Stage
+  - stage: DockerBuild
+    displayName: 'Build and Push Docker Image'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - job: DockerBuildPush
+        displayName: 'Build and Push to ACR'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          # Download build artifacts
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Download Build Artifacts'
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'drop'
+              downloadPath: '$(System.ArtifactsDirectory)'
+
+          # Build and push Docker image
+          - task: Docker@2
+            displayName: 'Build and Push Docker Image'
+            inputs:
+              containerRegistry: '$(dockerRegistryServiceConnection)'
+              repository: '$(imageRepository)'
+              command: 'buildAndPush'
+              Dockerfile: '$(dockerfilePath)'
+              buildContext: '$(Build.SourcesDirectory)'
+              tags: |
+                $(tag)
+                latest
+              arguments: '--build-arg VERSION=$(Build.BuildNumber)'
+
+  # Deploy to Azure Container Instances
+  - stage: Deploy
+    displayName: 'Deploy to Azure Container Instances'
+    dependsOn: DockerBuild
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployToACI
+        displayName: 'Deploy to ACI'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Deploy to Azure Container Instances
+                - task: AzureCLI@2
+                  displayName: 'Deploy to Azure Container Instances'
+                  inputs:
+                    azureSubscription: 'AzureServiceConnection'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      az container create \
+                        --resource-group $(resourceGroupName) \
+                        --name addressbook-api \
+                        --image $(containerRegistry)/$(imageRepository):$(tag) \
+                        --cpu 1 \
+                        --memory 1.5 \
+                        --ports 8080 \
+                        --dns-name-label addressbook-api-$(Build.BuildId) \
+                        --registry-login-server $(containerRegistry) \
+                        --registry-username $(acrUsername) \
+                        --registry-password $(acrPassword) \
+                        --environment-variables \
+                          SPRING_PROFILES_ACTIVE=prod
